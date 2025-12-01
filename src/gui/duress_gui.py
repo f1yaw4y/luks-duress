@@ -4,6 +4,7 @@ import os
 import json
 import uuid
 import socket
+import subprocess  # for auto-detect in DeviceDialog and global
 
 from PyQt5.QtWidgets import (
     QApplication,
@@ -81,6 +82,9 @@ class DeviceDialog(QDialog):
         self.pid_edit = QLineEdit(self.device.get("pid", ""))
         self.serial_edit = QLineEdit(self.device.get("serial", ""))
 
+        # wipe target path field (per-device)
+        self.wipe_target_edit = QLineEdit(self.device.get("wipe_target", ""))
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(self.MODES)
         val = self.device.get("mode", "insert")
@@ -105,6 +109,13 @@ class DeviceDialog(QDialog):
         layout.addRow("VID (hex):", self.vid_edit)
         layout.addRow("PID (hex):", self.pid_edit)
         layout.addRow("Serial:", self.serial_edit)
+        layout.addRow("Wipe Target Device:", self.wipe_target_edit)
+
+        # Optional convenience: auto-detect button
+        auto_btn = QPushButton("Auto-detect System LUKS Device")
+        auto_btn.clicked.connect(self.auto_detect_wipe_target)
+        layout.addRow(auto_btn)
+
         layout.addRow("Mode:", self.mode_combo)
         layout.addRow("Action:", self.action_combo)
         layout.addRow("Custom command:", self.custom_cmd_edit)
@@ -122,6 +133,31 @@ class DeviceDialog(QDialog):
 
         self.setLayout(layout)
 
+    def auto_detect_wipe_target(self):
+        """
+        Try to auto-detect the physical device backing the root filesystem.
+        Fills wipe_target_edit with something like /dev/nvme0n1 or /dev/sda.
+        """
+        try:
+            src = subprocess.check_output(
+                ["findmnt", "-no", "SOURCE", "/"],
+                text=True
+            ).strip()
+
+            base = subprocess.check_output(
+                ["lsblk", "-no", "PKNAME", src],
+                text=True
+            ).strip()
+
+            if base:
+                dev = f"/dev/{base}"
+            else:
+                dev = src
+
+            self.wipe_target_edit.setText(dev)
+        except Exception as e:
+            QMessageBox.warning(self, "Auto-detect failed", str(e))
+
     def get_device(self):
         d = self.device.copy()
         if not d.get("id"):
@@ -131,6 +167,7 @@ class DeviceDialog(QDialog):
         d["vid"] = self.vid_edit.text().strip()
         d["pid"] = self.pid_edit.text().strip()
         d["serial"] = self.serial_edit.text().strip()
+        d["wipe_target"] = self.wipe_target_edit.text().strip()
         d["mode"] = self.mode_combo.currentText()
         d["action"] = self.action_combo.currentText()
         d["custom_cmd"] = self.custom_cmd_edit.text().strip()
@@ -158,6 +195,7 @@ class DuressMainWindow(QMainWindow):
             "action": "lock",
             "custom_cmd": "",
             "test_mode": True,
+            "wipe_target": "",
         }
 
         self.last_event = None
@@ -201,7 +239,30 @@ class DuressMainWindow(QMainWindow):
         row1.addWidget(QLabel("Action:"))
         row1.addWidget(self.global_action_combo)
         row1.addWidget(self.global_test_check)
+
+        # Row 2: global wipe target and auto-detect
+        row2 = QHBoxLayout()
+        self.global_wipe_target_edit = QLineEdit(self.global_rules.get("wipe_target", ""))
+        self.global_wipe_target_edit.editingFinished.connect(self.on_global_changed)
+
+        btn_global_auto = QPushButton("Auto-detect System LUKS Device")
+        btn_global_auto.clicked.connect(self.auto_detect_global_wipe_target)
+
+        row2.addWidget(QLabel("Wipe target:"))
+        row2.addWidget(self.global_wipe_target_edit)
+        row2.addWidget(btn_global_auto)
+
+        # Row 3: global custom command (used when action = command)
+        row3 = QHBoxLayout()
+        self.global_custom_cmd_edit = QLineEdit(self.global_rules.get("custom_cmd", ""))
+        self.global_custom_cmd_edit.editingFinished.connect(self.on_global_changed)
+
+        row3.addWidget(QLabel("Custom command:"))
+        row3.addWidget(self.global_custom_cmd_edit)
+
         global_box.addLayout(row1)
+        global_box.addLayout(row2)
+        global_box.addLayout(row3)
 
         # Visual separator
         sep = QWidget()
@@ -266,6 +327,11 @@ class DuressMainWindow(QMainWindow):
         central.setLayout(main_layout)
         self.setCentralWidget(central)
 
+        # Keep UI comfortably compact
+        self.setMinimumWidth(450)
+        self.setMaximumWidth(650)
+        self.resize(550, 600)
+
         # ========== Tray Icon ==========
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(make_circle_icon(QColor(60, 179, 113)))
@@ -287,6 +353,9 @@ class DuressMainWindow(QMainWindow):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.show()
 
+        # Click tray icon to toggle window
+        self.tray_icon.activated.connect(self.on_tray_activated)
+
         # Response socket
         self.recv_socket = None
         self.poll_timer = None
@@ -297,14 +366,6 @@ class DuressMainWindow(QMainWindow):
         self.request_devices()
         send_command("GET_GLOBAL")
 
-    def closeEvent(self, event):
-        """
-        Override the window close behavior so that the GUI hides instead
-        of quitting. The tray icon stays active.
-        """
-        event.ignore()
-        self.hide()
-
     # --------- Global UI helpers ---------
 
     def apply_global_rules_to_ui(self):
@@ -312,6 +373,8 @@ class DuressMainWindow(QMainWindow):
         mode_val = self.global_rules.get("mode", "any")
         action = self.global_rules.get("action", "lock")
         test = self.global_rules.get("test_mode", True)
+        wipe_target = self.global_rules.get("wipe_target", "")
+        custom_cmd = self.global_rules.get("custom_cmd", "")
 
         # Map daemon state → GUI state
         gui_mode = "off" if not active else mode_val
@@ -333,16 +396,30 @@ class DuressMainWindow(QMainWindow):
         self.global_action_combo.blockSignals(False)
         self.global_test_check.blockSignals(False)
 
+        # Update wipe target / custom command fields if they exist
+        if hasattr(self, "global_wipe_target_edit"):
+            self.global_wipe_target_edit.setText(wipe_target)
+        if hasattr(self, "global_custom_cmd_edit"):
+            self.global_custom_cmd_edit.setText(custom_cmd)
+
     def on_global_changed(self):
         """
-        Called whenever the global mode / action / test checkbox changes.
+        Called whenever the global mode / action / test checkbox changes
+        or when the global wipe target / custom command fields are edited.
+
         We map GUI's "off" -> active=False and avoid sending 'off' as mode
         to the daemon, which expects insert/remove/any.
         """
         gui_mode = self.global_mode_combo.currentText()
         effective_mode = "any" if gui_mode == "off" else gui_mode
 
-        custom_cmd = self.global_rules.get("custom_cmd", "")
+        wipe_target = ""
+        if hasattr(self, "global_wipe_target_edit"):
+            wipe_target = self.global_wipe_target_edit.text().strip()
+
+        custom_cmd = ""
+        if hasattr(self, "global_custom_cmd_edit"):
+            custom_cmd = self.global_custom_cmd_edit.text().strip()
 
         self.global_rules = {
             "active": (gui_mode != "off"),
@@ -350,10 +427,39 @@ class DuressMainWindow(QMainWindow):
             "action": self.global_action_combo.currentText(),
             "custom_cmd": custom_cmd,
             "test_mode": self.global_test_check.isChecked(),
+            "wipe_target": wipe_target,
         }
 
         payload = json.dumps(self.global_rules)
         send_command("SET_GLOBAL:" + payload)
+
+    def auto_detect_global_wipe_target(self):
+        """
+        Auto-detect the physical device backing the root filesystem and
+        put it into the global wipe target field.
+        """
+        try:
+            src = subprocess.check_output(
+                ["findmnt", "-no", "SOURCE", "/"],
+                text=True
+            ).strip()
+
+            base = subprocess.check_output(
+                ["lsblk", "-no", "PKNAME", src],
+                text=True
+            ).strip()
+
+            if base:
+                dev = f"/dev/{base}"
+            else:
+                dev = src
+
+            if hasattr(self, "global_wipe_target_edit"):
+                self.global_wipe_target_edit.setText(dev)
+            # propagate change to daemon
+            self.on_global_changed()
+        except Exception as e:
+            QMessageBox.warning(self, "Auto-detect failed", str(e))
 
     # --------- ARM / DISARM ---------
 
@@ -409,6 +515,7 @@ class DuressMainWindow(QMainWindow):
             "vid": self.last_event.get("vid", ""),
             "pid": self.last_event.get("pid", ""),
             "serial": self.last_event.get("serial", ""),
+            "wipe_target": "",
             "mode": "insert",
             "action": "wipe",
             "custom_cmd": "",
@@ -430,6 +537,7 @@ class DuressMainWindow(QMainWindow):
                 os.remove(SOCKET_GUI)
             self.recv_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             self.recv_socket.bind(SOCKET_GUI)
+            # Allow root daemon to write back to GUI socket
             os.chmod(SOCKET_GUI, 0o666)
             self.recv_socket.setblocking(False)
             print(f"[GUI] Response socket bound at {SOCKET_GUI}")
@@ -635,6 +743,13 @@ class DuressMainWindow(QMainWindow):
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.Trigger:
             self.toggle_window_visibility()
+
+    def closeEvent(self, event):
+        """
+        Hide to tray instead of quitting when the window close button is pressed.
+        """
+        event.ignore()
+        self.hide()
 
     def quit_app(self):
         self.tray_icon.hide()
