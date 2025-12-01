@@ -1,0 +1,10 @@
+{
+  "devices": [],
+  "global_rules": {
+    "active": false,
+    "mode": "any",
+    "action": "command",
+    "custom_cmd": "",
+    "test_mode": true
+  }
+}
