@@ -430,6 +430,7 @@ class DuressMainWindow(QMainWindow):
                 os.remove(SOCKET_GUI)
             self.recv_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             self.recv_socket.bind(SOCKET_GUI)
+            os.chmod(SOCKET_GUI, 0o666)
             self.recv_socket.setblocking(False)
             print(f"[GUI] Response socket bound at {SOCKET_GUI}")
         except OSError as e:
