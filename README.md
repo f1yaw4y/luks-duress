@@ -64,16 +64,16 @@ The script auto-detects the desktop environment and chooses the best locking met
 ## Installation
 
 ### 1. Clone the Repository
-\`\`\`bash
+```bash
 git clone https://github.com/f1yaw4y/luks-duress.git
 cd luks-duress
-\`\`\`
+```
 
 ### 2. Launch the installer
-\`\`\`bash
+```bash
 sudo chmod +x installer.sh
 ./installer.sh
-\`\`\`
+```
 
 After installation the daemon will:
 - Start at boot
@@ -84,7 +84,7 @@ After installation the daemon will:
 
 
 ## Project Structure
-\`\`\`
+```
 luks-duress/
 │
 ├── src/
@@ -104,7 +104,7 @@ luks-duress/
 ├── LICENSE
 │
 └── README.md
-\`\`\`
+```
 
 ## How It Works
 
