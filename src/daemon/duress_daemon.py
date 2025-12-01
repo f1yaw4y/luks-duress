@@ -77,6 +77,8 @@ def init_socket():
         os.remove(SOCKET_CMD)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(SOCKET_CMD)
+    # Allow all users to write to this command socket (or restrict to your group)
+    os.chmod(SOCKET_CMD, 0o666)
     print("[Daemon] Command socket initialized.")
     return sock
 
