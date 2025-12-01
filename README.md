@@ -3,6 +3,9 @@
 LUKS-Duress is an open-source Linux security tool that automatically performs duress actions (lock screen, shutdown, secure wipe, or custom commands) when specific USB events occur.
 This project was inspired by BusKill but expands its capabilities to create a fully configurable, GUI-controlled, per-device or global USB-trigger system — ideal for privacy-focused users, sysadmins, journalists, pentesters, or anyone who needs a reliable duress response system on their Linux machines.
 
+![alt text](https://github.com/f1yaw4y/luks-duress/blob/main/images/duress.png?raw=true)
+
+
 ## Features
 
 ### Per-Device USB Triggers
