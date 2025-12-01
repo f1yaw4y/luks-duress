@@ -14,6 +14,7 @@ import subprocess
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 CONFIG = os.path.join(PROJECT_ROOT, "config", "rules.json")
 
+
 def load_config():
     """
     Load devices + global_rules from config.
@@ -34,10 +35,16 @@ def load_config():
             "mode": "any",
             "action": "lock",
             "custom_cmd": "",
-            "test_mode": True
+            "test_mode": True,
+            "wipe_target": ""
         }
 
+    # Backfill missing wipe_target for older configs
+    if "wipe_target" not in data["global_rules"]:
+        data["global_rules"]["wipe_target"] = ""
+
     return data["devices"], data["global_rules"]
+
 
 def save_config(devices, global_rules):
     """
@@ -56,6 +63,7 @@ def save_config(devices, global_rules):
     except Exception as e:
         print("[Daemon] Error saving config:", e)
 
+
 devices, global_rules = load_config()
 
 # -------------------------------------------------
@@ -69,40 +77,182 @@ armed = False
 last_usb_event = None
 
 # -------------------------------------------------
-# SOCKET SETUP
+# SOCKET HELPERS
 # -------------------------------------------------
 
+
 def init_socket():
+    """
+    Create and bind a Unix datagram socket for receiving commands.
+    """
     if os.path.exists(SOCKET_CMD):
-        os.remove(SOCKET_CMD)
+        try:
+            os.remove(SOCKET_CMD)
+        except OSError:
+            pass
+
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(SOCKET_CMD)
-    # Allow all users to write to this command socket (or restrict to your group)
+
+    # Allow any user to write commands (GUI as user, daemon as root)
     os.chmod(SOCKET_CMD, 0o666)
-    print("[Daemon] Command socket initialized.")
+    print(f"[Daemon] Command socket bound at {SOCKET_CMD}")
     return sock
+
 
 def send_response(message: str):
     """
-    Daemon → GUI responses (GUI listener optional).
+    Send a response back to the GUI via SOCKET_GUI (if it exists).
     """
+    if not os.path.exists(SOCKET_GUI):
+        # GUI not listening
+        return
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        s.connect(SOCKET_GUI)
-        s.send(message.encode())
+        s.sendto(message.encode(), SOCKET_GUI)
         s.close()
-    except:
-        pass  # GUI listener may not be active yet.
+    except OSError as e:
+        print(f"[Daemon] Failed to send GUI response: {e}")
+
 
 # -------------------------------------------------
-# COMMAND HANDLER
+# USB MONITORING
 # -------------------------------------------------
+
+
+def usb_monitor():
+    """
+    Monitor USB add/remove events via pyudev.
+    """
+    global last_usb_event
+
+    context = pyudev.Context()
+    monitor = pyudev.Monitor.from_netlink(context)
+    monitor.filter_by(subsystem="usb")
+
+    # REQUIRED in most pyudev versions
+    monitor.enable_receiving()
+
+    print("[Daemon] Starting USB monitor...")
+
+    while True:
+        dev = monitor.poll(timeout=None)  # blocks until event
+
+        if dev is None:
+            continue
+
+        # Must check this because pyudev fires tons of sub-events
+        if dev.get("DEVTYPE") != "usb_device":
+            continue
+
+        action = dev.action  # 'add' or 'remove'
+
+        vid = (dev.get("ID_VENDOR_ID") or "").lower()
+        pid = (dev.get("ID_MODEL_ID") or "").lower()
+        serial = dev.get("ID_PATH") or dev.get("ID_SERIAL") or ""
+
+        event_action = "insert" if action == "add" else "remove"
+
+        last_usb_event = {
+            "action": event_action,
+            "vid": vid,
+            "pid": pid,
+            "serial": serial,
+        }
+
+        print(
+            f"[Daemon] USB event: {event_action} "
+            f"VID={vid} PID={pid} SERIAL={serial}"
+        )
+
+        # Hand back to existing logic
+        handle_usb_event(
+            event_action=event_action,
+            vid=vid,
+            pid=pid,
+            serial=serial,
+        )
+
+
+def matching_devices(event_action, vid, pid, serial):
+    """
+    Return list of device rules that match this USB event.
+    event_action: "insert" or "remove".
+    """
+    matches = []
+    for dev in devices:
+        if not dev.get("active", True):
+            continue
+
+        mode = dev.get("mode", "insert")
+        if mode not in ("insert", "remove", "any"):
+            mode = "insert"
+
+        if mode != "any" and mode != event_action:
+            continue
+
+        # Match by VID/PID/SERIAL. We treat empty fields as wildcards.
+        dvid = (dev.get("vid", "") or "").lower()
+        dpid = (dev.get("pid", "") or "").lower()
+        dser = dev.get("serial", "") or ""
+
+        if dvid and dvid != vid:
+            continue
+        if dpid and dpid != pid:
+            continue
+        if dser and dser != serial:
+            continue
+
+        matches.append(dev)
+    return matches
+
+
+def check_global_rule(event_action):
+    """
+    Check if global rule matches this USB event.
+    Returns the global_rules dict if it matches, else None.
+    """
+    if not global_rules.get("active", False):
+        return None
+
+    mode = global_rules.get("mode", "any")
+    if mode not in ("insert", "remove", "any"):
+        mode = "any"
+
+    if mode != "any" and mode != event_action:
+        return None
+
+    return global_rules
+
+
+def handle_usb_event(event_action, vid, pid, serial):
+    """
+    Called when a top-level USB device is added/removed.
+    event_action: 'insert' or 'remove'
+    """
+    # 1) Global rule
+    gl = check_global_rule(event_action)
+    if gl:
+        perform_action(gl, event_action, "GLOBAL")
+
+    # 2) Per-device rules
+    perdev = matching_devices(event_action, vid, pid, serial)
+    for dev_entry in perdev:
+        perform_action(dev_entry, event_action, dev_entry.get("name", "device"))
+
+
+# -------------------------------------------------
+# COMMAND HANDLING
+# -------------------------------------------------
+
 
 def handle_command(message: str):
-    global armed, devices, global_rules
+    """
+    Handle a single command string from the GUI.
+    """
+    global armed, devices, global_rules, last_usb_event
 
-    print(f"[Daemon] Received command: {message}")
-
+    # Simple state commands
     if message == "ARM":
         armed = True
         send_response("OK:ARMED")
@@ -121,130 +271,121 @@ def handle_command(message: str):
         send_response("GLOBAL:" + json.dumps(global_rules))
         return
 
-    if message.startswith("SET_GLOBAL:"):
-        json_str = message[len("SET_GLOBAL:"):]
-        try:
-            global_rules = json.loads(json_str)
-            save_config(devices, global_rules)
-            send_response("OK:GLOBAL_UPDATED")
-        except:
-            send_response("ERROR:BAD_GLOBAL_JSON")
+    if message == "LAST_EVENT":
+        payload = json.dumps(last_usb_event or {})
+        send_response("LAST_EVENT:" + payload)
         return
 
-    if message.startswith("LAST_EVENT"):
-        if last_usb_event:
-            send_response("LAST_EVENT:" + json.dumps(last_usb_event))
-        else:
-            send_response("LAST_EVENT:{}")
+    # More complex commands with payloads
+    if message.startswith("SET_GLOBAL:"):
+        payload = message[len("SET_GLOBAL:"):]
+        try:
+            new_gl = json.loads(payload)
+        except Exception as e:
+            print("[Daemon] Failed to parse SET_GLOBAL payload:", e)
+            send_response("ERROR:BAD_GLOBAL_JSON")
+            return
+
+        # Ensure wipe_target always exists
+        if "wipe_target" not in new_gl:
+            new_gl["wipe_target"] = global_rules.get("wipe_target", "")
+
+        global_rules = new_gl
+        save_config(devices, global_rules)
+        send_response("OK:GLOBAL_UPDATED")
         return
 
     if message.startswith("ADD_DEVICE:"):
-        json_str = message[len("ADD_DEVICE:"):]
+        payload = message[len("ADD_DEVICE:"):]
         try:
-            dev = json.loads(json_str)
+            dev = json.loads(payload)
+        except Exception as e:
+            print("[Daemon] Failed to parse ADD_DEVICE payload:", e)
+            send_response("ERROR:BAD_DEVICE_JSON")
+            return
+
+        # upsert by id
+        dev_id = dev.get("id")
+        if not dev_id:
+            send_response("ERROR:MISSING_DEVICE_ID")
+            return
+
+        for i, d in enumerate(devices):
+            if d.get("id") == dev_id:
+                devices[i] = dev
+                break
+        else:
             devices.append(dev)
-            save_config(devices, global_rules)
-            send_response("OK:ADDED")
-        except:
-            send_response("ERROR:BAD_JSON")
+
+        save_config(devices, global_rules)
+        send_response("OK:DEVICE_ADDED")
         return
 
     if message.startswith("UPDATE_DEVICE:"):
-        json_str = message[len("UPDATE_DEVICE:"):]
+        payload = message[len("UPDATE_DEVICE:"):]
         try:
-            updated = json.loads(json_str)
-            uuid = updated.get("id")
-            for i, d in enumerate(devices):
-                if d["id"] == uuid:
-                    devices[i] = updated
-                    save_config(devices, global_rules)
-                    send_response("OK:UPDATED")
-                    return
-            send_response("ERROR:UUID_NOT_FOUND")
-        except:
-            send_response("ERROR:BAD_JSON")
+            dev = json.loads(payload)
+        except Exception as e:
+            print("[Daemon] Failed to parse UPDATE_DEVICE payload:", e)
+            send_response("ERROR:BAD_DEVICE_JSON")
+            return
+
+        dev_id = dev.get("id")
+        if not dev_id:
+            send_response("ERROR:MISSING_DEVICE_ID")
+            return
+
+        for i, d in enumerate(devices):
+            if d.get("id") == dev_id:
+                devices[i] = dev
+                save_config(devices, global_rules)
+                send_response("OK:DEVICE_UPDATED")
+                return
+
+        send_response("ERROR:DEVICE_NOT_FOUND")
         return
 
     if message.startswith("DELETE_DEVICE:"):
-        uuid = message.split(":",1)[1]
-        new_list = [d for d in devices if d["id"] != uuid]
-        if len(new_list) == len(devices):
-            send_response("ERROR:UUID_NOT_FOUND")
-        else:
-            devices = new_list
+        dev_id = message[len("DELETE_DEVICE:"):]
+        before = len(devices)
+        devices = [d for d in devices if d.get("id") != dev_id]
+        if len(devices) != before:
             save_config(devices, global_rules)
-            send_response("OK:DELETED")
+            send_response("OK:DEVICE_DELETED")
+        else:
+            send_response("ERROR:DEVICE_NOT_FOUND")
         return
 
-    if message.startswith("SET_ACTIVE:"):
-        _, uuid, onoff = message.split(":")
-        onoff = bool(int(onoff))
-        for d in devices:
-            if d["id"] == uuid:
-                d["active"] = onoff
-                save_config(devices, global_rules)
-                send_response("OK:SET_ACTIVE")
-                return
-        send_response("ERROR:UUID_NOT_FOUND")
-        return
+    print(f"[Daemon] Unknown command: {message}")
 
-    send_response("ERROR:UNKNOWN_COMMAND")
 
 def socket_listener(sock):
+    """
+    Thread: listens for commands on SOCKET_CMD.
+    """
+    print("[Daemon] Socket listener running...")
     while True:
-        data, _ = sock.recvfrom(4096)
-        if data:
-            handle_command(data.decode())
-
-# -------------------------------------------------
-# MATCHING LOGIC
-# -------------------------------------------------
-
-def matches_mode(mode, action):
-    return (
-        (mode == "insert" and action == "add") or
-        (mode == "remove" and action == "remove") or
-        (mode == "any" and action in ("add", "remove"))
-    )
-
-def matching_devices(event_action, vid, pid, serial):
-    matched = []
-
-    for d in devices:
-        if not d.get("active", False):
+        try:
+            data, _ = sock.recvfrom(4096)
+        except OSError:
+            break
+        if not data:
             continue
+        msg = data.decode(errors="ignore")
+        handle_command(msg)
 
-        d_vid = d.get("vid")
-        d_pid = d.get("pid")
-        d_serial = d.get("serial")
 
-        # INSERT must match everything
-        if event_action == "add":
-            if d_vid != vid or d_pid != pid:
-                continue
-            if d_serial != serial:
-                continue
-
-        # REMOVE should match *only serial* (VID/PID often differ)
-        elif event_action == "remove":
-            if d_serial != serial:
-                continue
-
-        # Mode check
-        if matches_mode(d.get("mode", "insert"), event_action):
-            matched.append(d)
-
-    return matched
 # -------------------------------------------------
 # ACTION EXECUTION
 # -------------------------------------------------
+
 
 def perform_action(action_dict, event_action, name):
     global armed
 
     action = action_dict.get("action", "lock")
     test_mode = action_dict.get("test_mode", True)
-    custom_cmd = action_dict.get("custom_cmd","")
+    custom_cmd = action_dict.get("custom_cmd", "")
 
     if not armed:
         print(f"[Daemon] Trigger matched but system DISARMED.")
@@ -265,7 +406,11 @@ def perform_action(action_dict, event_action, name):
         return
 
     if action == "wipe":
-        print("[Daemon] WIPE REQUESTED — no wipe targets defined yet.")
+        wipe_target = action_dict.get("wipe_target", "").strip()
+        if not wipe_target:
+            print("[Daemon] WIPE REQUESTED but no 'wipe_target' specified in rule.")
+            return
+        perform_header_wipe(wipe_target)
         return
 
     if action == "command":
@@ -275,77 +420,28 @@ def perform_action(action_dict, event_action, name):
         subprocess.run(custom_cmd, shell=True)
         return
 
+
 # -------------------------------------------------
-# LOCK SCREEN HELPER
+# HELPERS (LOCK + WIPE)
 # -------------------------------------------------
+
 
 def run_lock_helper():
     helper = os.path.join(PROJECT_ROOT, "src/daemon/helpers/lock-screen.sh")
-
+    print(f"[Daemon] Invoking lock helper: {helper}")
     try:
         subprocess.run(["bash", helper], check=False)
     except Exception as e:
-        print("[Daemon] Lock helper error:",e)
+        print("[Daemon] Lock helper error:", e)
 
-# -------------------------------------------------
-# USB MONITOR
-# -------------------------------------------------
 
-def usb_monitor():
-    global last_usb_event
-
-    ctx = pyudev.Context()
-    mon = pyudev.Monitor.from_netlink(ctx)
-    mon.filter_by(subsystem='usb')
-
-    print("[Daemon] Monitoring USB events...")
-
-    for dev in iter(mon.poll, None):
-        action = dev.action  # "add" / "remove"
-        if action not in ("add", "remove"):
-            continue
-
-        # -----------------------------------------
-        # FIX: Use device properties instead of attributes
-        # These survive even during 'remove' events.
-        # -----------------------------------------
-        vid = dev.get("ID_VENDOR_ID")
-        pid = dev.get("ID_MODEL_ID")
-        serial = dev.get("ID_SERIAL_SHORT")
-
-        # Ignore events that still have no identifiers
-        if not (vid and pid and serial):
-            # Removal events may be missing direct IDs;
-            # Try resolving from parent device node.
-            parent = dev.find_parent("usb", "usb_device")
-            if parent:
-                vid = vid or parent.get("ID_VENDOR_ID")
-                pid = pid or parent.get("ID_MODEL_ID")
-                serial = serial or parent.get("ID_SERIAL_SHORT")
-
-        if not (vid and pid and serial):
-            # Still nothing? Then skip — but now rarely happens.
-            continue
-
-        last_usb_event = {
-            "action": action,
-            "vid": vid,
-            "pid": pid,
-            "serial": serial
-        }
-
-        print(f"[USB] {action.upper()} VID={vid} PID={pid} SERIAL={serial}")
-
-        # --- 1. GLOBAL RULES ---
-        if global_rules.get("active", False):
-            if matches_mode(global_rules.get("mode", "any"), action):
-                perform_action(global_rules, action, "GLOBAL-RULE")
-                
-
-        # --- 2. PER-DEVICE RULES ---
-        perdev = matching_devices(action, vid, pid, serial)
-        for dev_entry in perdev:
-            perform_action(dev_entry, action, dev_entry.get("name", "device"))
+def perform_header_wipe(target):
+    helper = os.path.join(PROJECT_ROOT, "src/daemon/helpers/wipe-luks-header.sh")
+    print(f"[Daemon] Invoking header wipe helper for {target}...")
+    try:
+        subprocess.run(["bash", helper, target], check=False)
+    except Exception as e:
+        print("[Daemon] Wipe helper error:", e)
 
 
 # -------------------------------------------------
