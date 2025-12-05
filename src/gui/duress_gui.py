@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QCheckBox,
     QMessageBox,
+    QTextEdit,
 )
 from PyQt5.QtGui import (
     QIcon,
@@ -37,6 +38,10 @@ from PyQt5.QtCore import Qt, QTimer
 
 SOCKET_CMD = "/tmp/luks-duress.sock"
 SOCKET_GUI = "/tmp/luks-duress_gui"
+SOCKET_LOG_GUI = "/tmp/luks-duress_log_gui"  # daemon sends logs to this path
+
+# Circular buffer limit for daemon logs
+LOG_BUFFER_LIMIT = 5000
 
 
 def send_command(cmd: str):
@@ -176,6 +181,43 @@ class DeviceDialog(QDialog):
         return d
 
 
+class DevLogWindow(QWidget):
+    def __init__(self):
+        # Make this a true top-level window (parent=None)
+        super().__init__(None)
+        self.setWindowTitle("Daemon Log Output")
+        # start a bit larger to avoid crowding the main UI
+        self.resize(900, 600)
+
+        layout = QVBoxLayout()
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setStyleSheet("""
+            background-color: #111;
+            color: #0f0;
+            font-family: monospace;
+            font-size: 11pt;
+        """)
+
+        # Make it behave like a terminal: no wrap + scrollbars as needed
+        # QTextEdit uses setLineWrapMode; use NoWrap to prevent clipping
+        try:
+            self.text.setLineWrapMode(QTextEdit.NoWrap)
+        except Exception:
+            # keep best-effort compatibility
+            pass
+        self.text.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.text.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        layout.addWidget(self.text)
+        self.setLayout(layout)
+
+    def append_line(self, line: str):
+        # append keeps existing behavior and scrolls to bottom
+        self.text.append(line)
+        self.text.moveCursor(self.text.textCursor().End)
+
+
 class DuressMainWindow(QMainWindow):
     GLOBAL_MODES = ["off", "insert", "remove", "any"]
     GLOBAL_ACTIONS = ["wipe", "lock", "shutdown", "command"]
@@ -201,6 +243,10 @@ class DuressMainWindow(QMainWindow):
         self.last_event = None
         self.request_mode = None   # None / "identify" / "register"
 
+        # Daemon log buffer + dev window
+        self.daemon_log_buffer = []   # lines from daemon (circular)
+        self.dev_window = None
+
         # --- Top-level layout ---
         central = QWidget()
         main_layout = QVBoxLayout()
@@ -214,6 +260,11 @@ class DuressMainWindow(QMainWindow):
         self.toggle_button.clicked.connect(self.toggle_arm_state)
         status_layout.addWidget(self.status_label)
         status_layout.addWidget(self.toggle_button)
+
+        # Dev button (open daemon log window)
+        btn_dev = QPushButton("Dev")
+        btn_dev.clicked.connect(self.open_dev_window)
+        status_layout.addWidget(btn_dev)
 
         # ========== GLOBAL RULES SECTION ==========
         global_box = QVBoxLayout()
@@ -360,6 +411,11 @@ class DuressMainWindow(QMainWindow):
         self.recv_socket = None
         self.poll_timer = None
         self.setup_response_socket()
+
+        # Log socket (daemon -> GUI)
+        self.log_socket = None
+        self.log_timer = None
+        self.setup_log_socket()
 
         # Load initial settings
         self.update_ui()
@@ -626,6 +682,56 @@ class DuressMainWindow(QMainWindow):
             print("[GUI] Daemon ERROR:", msg)
             return
 
+    # --------- DAEMON LOG SOCKET ---------
+
+    def setup_log_socket(self):
+        """
+        Bind to SOCKET_LOG_GUI to receive daemon's forwarded print() lines.
+        Daemon will sendto() this path. We use a non-blocking recv loop.
+        """
+        try:
+            if os.path.exists(SOCKET_LOG_GUI):
+                os.remove(SOCKET_LOG_GUI)
+            self.log_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            self.log_socket.bind(SOCKET_LOG_GUI)
+            os.chmod(SOCKET_LOG_GUI, 0o666)
+            self.log_socket.setblocking(False)
+            print(f"[GUI] Log socket bound at {SOCKET_LOG_GUI}")
+        except OSError as e:
+            print(f"[GUI] Failed to bind log socket: {e}")
+            self.log_socket = None
+            return
+
+        self.log_timer = QTimer(self)
+        self.log_timer.timeout.connect(self.poll_daemon_logs)
+        self.log_timer.start(200)
+
+    def poll_daemon_logs(self):
+        if not self.log_socket:
+            return
+        while True:
+            try:
+                data, _ = self.log_socket.recvfrom(8192)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not data:
+                break
+            line = data.decode(errors="ignore")
+            # maintain circular buffer
+            self.daemon_log_buffer.append(line)
+            if len(self.daemon_log_buffer) > LOG_BUFFER_LIMIT:
+                # drop oldest
+                excess = len(self.daemon_log_buffer) - LOG_BUFFER_LIMIT
+                if excess >= len(self.daemon_log_buffer):
+                    self.daemon_log_buffer = []
+                else:
+                    self.daemon_log_buffer = self.daemon_log_buffer[excess:]
+            # push to open window if exists
+            if self.dev_window:
+                self.dev_window.append_line(line)
+
     # --------- Device Table ---------
 
     def request_devices(self):
@@ -731,6 +837,20 @@ class DuressMainWindow(QMainWindow):
         send_command(f"DELETE_DEVICE:{dev_id}")
         self.request_devices()
 
+    # --------- Dev window helpers ---------
+
+    def open_dev_window(self):
+        # create as top-level window (no parent)
+        if self.dev_window is None:
+            self.dev_window = DevLogWindow()
+            # preload buffer
+            for line in self.daemon_log_buffer:
+                self.dev_window.append_line(line)
+        # show top-level window; main GUI remains usable
+        self.dev_window.show()
+        self.dev_window.raise_()
+        self.dev_window.activateWindow()
+
     # --------- Tray / Window helpers ---------
 
     def toggle_window_visibility(self):
@@ -761,6 +881,16 @@ class DuressMainWindow(QMainWindow):
             if os.path.exists(SOCKET_GUI):
                 try:
                     os.remove(SOCKET_GUI)
+                except Exception:
+                    pass
+        if self.log_socket:
+            try:
+                self.log_socket.close()
+            except Exception:
+                pass
+            if os.path.exists(SOCKET_LOG_GUI):
+                try:
+                    os.remove(SOCKET_LOG_GUI)
                 except Exception:
                     pass
         QApplication.quit()
