@@ -6,6 +6,39 @@ import sys
 import socket
 import threading
 import subprocess
+import builtins
+
+# -------------------------------------------------
+# LOG SOCKET (daemon sends to GUI bind path)
+# -------------------------------------------------
+
+SOCKET_LOG_GUI = "/tmp/luks-duress_log_gui"
+
+def send_log_to_gui(line: str):
+    """
+    Send a log line to the GUI log socket. GUI binds to SOCKET_LOG_GUI.
+    We create a transient AF_UNIX SOCK_DGRAM socket for each send to keep things simple.
+    If GUI is not present, this will fail silently.
+    """
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        # send to GUI socket path
+        s.sendto(line.encode(), SOCKET_LOG_GUI)
+        s.close()
+    except Exception:
+        # silent fail if gui not present or file removed
+        pass
+
+# Wrap built-in print so every print is also forwarded to GUI.
+_real_print = builtins.print
+def print(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
+    # forward to GUI (best-effort)
+    try:
+        send_log_to_gui(text)
+    except Exception:
+        pass
+    _real_print(*args, **kwargs)
 
 # -------------------------------------------------
 # CONFIG LOADING
